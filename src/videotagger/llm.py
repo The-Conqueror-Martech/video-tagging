@@ -58,17 +58,27 @@ def get_llm_client(config: LLMConfig | None = None, endpoint_override: str | Non
     )
 
 
-def build_vision_messages(frames_base64: list[str]) -> list[dict[str, Any]]:
+def build_vision_messages(
+    frames_base64: list[str],
+    system_prompt: str | None = None,
+    user_prompt: str | None = None,
+) -> list[dict[str, Any]]:
     """Build messages array for vision model.
 
     Args:
         frames_base64: List of base64-encoded frame images.
+        system_prompt: Optional custom system prompt. Defaults to SYSTEM_PROMPT.
+        user_prompt: Optional custom user prompt. Defaults to USER_PROMPT.
 
     Returns:
         Messages array for OpenAI chat completion.
     """
+    # Use provided prompts or fall back to defaults
+    sys_prompt = system_prompt if system_prompt is not None else SYSTEM_PROMPT
+    usr_prompt = user_prompt if user_prompt is not None else USER_PROMPT
+
     # Build content array with text and images
-    content: list[dict[str, Any]] = [{"type": "text", "text": USER_PROMPT}]
+    content: list[dict[str, Any]] = [{"type": "text", "text": usr_prompt}]
 
     for frame_b64 in frames_base64:
         content.append(
@@ -81,16 +91,17 @@ def build_vision_messages(frames_base64: list[str]) -> list[dict[str, Any]]:
         )
 
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": sys_prompt},
         {"role": "user", "content": content},
     ]
 
 
-def parse_tags_response(response_text: str) -> dict[str, Any]:
+def parse_tags_response(response_text: str, strict: bool = False) -> dict[str, Any]:
     """Parse and validate the LLM response as JSON.
 
     Args:
         response_text: Raw text response from the LLM.
+        strict: If True, require visual_hook field. Default False for backward compat.
 
     Returns:
         Parsed tags dictionary.
@@ -100,6 +111,20 @@ def parse_tags_response(response_text: str) -> dict[str, Any]:
     """
     # Clean up response (remove potential markdown code blocks)
     text = response_text.strip()
+
+    # Handle "Thinking" models that output reasoning before JSON
+    # Look for </think> tag and extract content after it
+    if "</think>" in text:
+        text = text.split("</think>")[-1].strip()
+
+    # Also try to find JSON object if there's text before it
+    if not text.startswith("{"):
+        # Try to find the first { and last }
+        start_idx = text.find("{")
+        end_idx = text.rfind("}")
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            text = text[start_idx : end_idx + 1]
+
     if text.startswith("```"):
         lines = text.split("\n")
         # Remove first and last lines if they're code block markers
@@ -114,10 +139,9 @@ def parse_tags_response(response_text: str) -> dict[str, Any]:
     except json.JSONDecodeError as e:
         raise LLMError(f"Failed to parse LLM response as JSON: {e}", e) from e
 
-    # Validate required fields
+    # Validate required fields (accept either branded_items or items)
     required_fields = [
         "setting",
-        "branded_items",
         "cta",
         "key_text",
         "content_type",
@@ -125,11 +149,19 @@ def parse_tags_response(response_text: str) -> dict[str, Any]:
     ]
     missing = [f for f in required_fields if f not in data]
 
+    # Check for items or branded_items
+    if "items" not in data and "branded_items" not in data:
+        missing.append("items")
+
     if missing:
         raise LLMError(f"LLM response missing required fields: {missing}")
 
+    # Normalize: rename branded_items to items if present
+    if "branded_items" in data and "items" not in data:
+        data["items"] = data.pop("branded_items")
+
     # Ensure list fields are lists
-    for field in ["branded_items", "cta", "key_text"]:
+    for field in ["items", "cta", "key_text"]:
         if not isinstance(data[field], list):
             data[field] = [data[field]] if data[field] else []
 
@@ -152,6 +184,44 @@ def parse_tags_response(response_text: str) -> dict[str, Any]:
         data.pop("copyright_markers", None)
         data.pop("copyright_risk", None)
 
+    # Handle visual_hook - new field for Visual Hook analysis
+    if "visual_hook" not in data:
+        data["visual_hook"] = {
+            "action": "unknown",
+            "subject": "unknown",
+            "environment": "unknown",
+        }
+    elif isinstance(data["visual_hook"], dict):
+        # Ensure all sub-fields exist
+        for subfield in ["action", "subject", "environment"]:
+            if subfield not in data["visual_hook"]:
+                data["visual_hook"][subfield] = "unknown"
+    else:
+        # Invalid format, reset to default
+        data["visual_hook"] = {
+            "action": "unknown",
+            "subject": "unknown",
+            "environment": "unknown",
+        }
+
+    # Handle copy_structure - new field for transcript analysis
+    if "copy_structure" in data:
+        if isinstance(data["copy_structure"], dict):
+            # Ensure framework exists
+            if "framework" not in data["copy_structure"]:
+                data["copy_structure"]["framework"] = "unknown"
+            if "breakdown" not in data["copy_structure"]:
+                data["copy_structure"]["breakdown"] = {}
+            elif not isinstance(data["copy_structure"]["breakdown"], dict):
+                data["copy_structure"]["breakdown"] = {}
+        else:
+            # Invalid format, reset to default
+            data["copy_structure"] = {
+                "framework": "unknown",
+                "breakdown": {},
+            }
+    # Note: copy_structure is optional - only present when transcript was analyzed
+
     return data
 
 
@@ -159,6 +229,8 @@ def analyze_frames(
     frames_base64: list[str],
     config: LLMConfig | None = None,
     endpoint_override: str | None = None,
+    system_prompt: str | None = None,
+    user_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Analyze video frames using vision-language model.
 
@@ -166,6 +238,8 @@ def analyze_frames(
         frames_base64: List of base64-encoded frame images.
         config: Optional LLMConfig. If None, loads from Settings.
         endpoint_override: Optional endpoint URL to override config (for dynamic RunPod URLs).
+        system_prompt: Optional custom system prompt for dynamic prompting.
+        user_prompt: Optional custom user prompt for dynamic prompting.
 
     Returns:
         Dictionary with extracted tags.
@@ -182,16 +256,23 @@ def analyze_frames(
     logger.info(f"Number of frames: {len(frames_base64)}")
 
     client = get_llm_client(config, endpoint_override=endpoint_override)
-    messages = build_vision_messages(frames_base64)
+    messages = build_vision_messages(
+        frames_base64,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
 
     logger.debug(f"Sending request to LLM with {len(messages)} messages")
 
     try:
         logger.info("Making LLM API call...")
+        # Use higher max_tokens for "Thinking" models that output reasoning
+        max_tokens = 4096 if "Thinking" in config.model else 2048
+
         response = client.chat.completions.create(
             model=config.model,
             messages=messages,
-            max_tokens=2048,
+            max_tokens=max_tokens,
             temperature=0.3,
         )
 

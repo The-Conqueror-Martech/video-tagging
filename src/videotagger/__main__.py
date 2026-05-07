@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from videotagger.config import Settings, mask_credential
 from videotagger.exceptions import LLMError, VideoProcessingError
 from videotagger.logging_config import setup_logging
-from videotagger.pipeline import process_video
+from videotagger.pipeline import process_video, process_video_with_context
 
 # Global debug flag
 DEBUG = False
@@ -182,11 +182,100 @@ def analyze_audio_command(video_path: str, debug: bool = False) -> int:
         return 1
 
 
+def process_with_context_command(
+    video_path: str,
+    art_id: str | None = None,
+    no_transcript: bool = False,
+    debug: bool = False,
+) -> int:
+    """Process a video with Visual Hook analysis and optional Airtable context.
+
+    This uses the enhanced pipeline with:
+    - Weighted frame extraction (dense first 1.5s, sparse after)
+    - Dynamic prompts from Airtable context (if art_id provided)
+    - Speech-to-text transcription for Copy Structure analysis
+    - Visual Hook output (action, subject, environment)
+
+    Args:
+        video_path: Path to the video file.
+        art_id: Optional Art ID to fetch Airtable context (e.g., "a1433").
+        no_transcript: Skip transcription (faster, no Copy Structure).
+        debug: Enable debug logging.
+
+    Returns:
+        Exit code: 0 for success, 1 for errors.
+    """
+    from pathlib import Path
+
+    load_dotenv()
+    setup_logging(debug=debug)
+
+    video_path_obj = Path(video_path)
+    if not video_path_obj.exists():
+        print(f"Error: File not found: {video_path}")
+        return 1
+
+    try:
+        print(f"Processing video: {video_path_obj.name}")
+        if art_id:
+            print(f"Fetching Airtable context for: {art_id}")
+        if not no_transcript:
+            print("Transcription enabled (first run downloads Whisper model ~140MB)")
+        print()
+
+        tags = process_video_with_context(
+            video_path=video_path,
+            art_id=art_id,
+            include_transcript=not no_transcript,
+        )
+
+        print("\nExtracted tags:")
+        print(json.dumps(tags, indent=2, ensure_ascii=False))
+
+        # Summary
+        print("\n" + "-" * 40)
+        print("Summary:")
+        if "visual_hook" in tags:
+            vh = tags["visual_hook"]
+            print(f"  Visual Hook: {vh.get('action', 'unknown')} | {vh.get('subject', 'unknown')} | {vh.get('environment', 'unknown')}")
+        if "copy_structure" in tags:
+            cs = tags["copy_structure"]
+            print(f"  Copy Structure: {cs.get('framework', 'unknown')}")
+        if "_metadata" in tags:
+            meta = tags["_metadata"]
+            print(f"  Frames: {meta.get('hook_frames', 0)} hook + {meta.get('context_frames', 0)} context")
+            print(f"  Transcript: {'Yes' if meta.get('has_transcript') else 'No'}")
+            print(f"  Airtable Context: {'Yes' if meta.get('has_airtable_context') else 'No'}")
+
+        return 0
+
+    except VideoProcessingError as e:
+        print(f"Video processing error: {e}")
+        if debug and e.video_path:
+            print(f"  Video path: {e.video_path}")
+        return 1
+
+    except LLMError as e:
+        print(f"LLM error: {e}")
+        if debug and e.original_error:
+            print(f"  Original error: {type(e.original_error).__name__}: {e.original_error}")
+        return 1
+
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        if debug:
+            import traceback
+
+            traceback.print_exc()
+        return 1
+
+
 def main() -> None:
     """Main CLI entry point."""
-    # Check for debug flag
+    # Check for flags
     debug = "--debug" in sys.argv or "-d" in sys.argv
-    args = [a for a in sys.argv[1:] if a not in ("--debug", "-d")]
+    no_transcript = "--no-transcript" in sys.argv
+    args = [a for a in sys.argv[1:] if a not in ("--debug", "-d", "--no-transcript")]
 
     # Default to TUI if no command given
     if len(args) < 1:
@@ -203,6 +292,21 @@ def main() -> None:
             print("Usage: python -m videotagger process <video_path> [--debug]")
             sys.exit(1)
         sys.exit(process_video_command(args[1], debug=debug))
+    elif command == "analyze":
+        # New command: analyze with Visual Hook + Copy Structure
+        if len(args) < 2:
+            print("Usage: python -m videotagger analyze <video_path> [art_id] [--no-transcript] [--debug]")
+            print("\nExamples:")
+            print("  python -m videotagger analyze video.mp4")
+            print("  python -m videotagger analyze video.mp4 a1433")
+            print("  python -m videotagger analyze video.mp4 --no-transcript")
+            sys.exit(1)
+        video_path = args[1]
+        # Check if second arg is art_id (starts with 'a' followed by digits)
+        art_id = None
+        if len(args) >= 3 and args[2].startswith("a") and args[2][1:].isdigit():
+            art_id = args[2]
+        sys.exit(process_with_context_command(video_path, art_id=art_id, no_transcript=no_transcript, debug=debug))
     elif command == "audio":
         if len(args) < 2:
             print("Usage: python -m videotagger audio <video_path> [--debug]")
@@ -211,16 +315,22 @@ def main() -> None:
     elif command in ["--help", "-h"]:
         print("Usage: python -m videotagger [command] [args] [--debug]")
         print("\nCommands:")
-        print("  tui                   Launch interactive TUI (default)")
-        print("  validate-config       Validate configuration and display status")
-        print("  process <video_path>  Process a video and extract tags (vision + audio)")
-        print("  audio <video_path>    Analyze audio only (local, no GPU needed)")
+        print("  tui                       Launch interactive TUI (default)")
+        print("  validate-config           Validate configuration and display status")
+        print("  analyze <video> [art_id]  NEW: Visual Hook + Copy Structure analysis")
+        print("  process <video_path>      Legacy: Process a video (basic tagging)")
+        print("  audio <video_path>        Analyze audio only (local, no GPU needed)")
         print("\nOptions:")
-        print("  --debug, -d           Enable debug logging")
+        print("  --debug, -d               Enable debug logging")
+        print("  --no-transcript           Skip audio transcription (faster)")
+        print("\nExamples:")
+        print("  python -m videotagger analyze my_video.mp4")
+        print("  python -m videotagger analyze my_video.mp4 a1433  # with Airtable context")
+        print("  python -m videotagger analyze my_video.mp4 --no-transcript --debug")
         sys.exit(0)
     else:
         print(f"Unknown command: {command}")
-        print("Available commands: tui, validate-config, process, audio")
+        print("Available commands: tui, validate-config, analyze, process, audio")
         print("Run with --help for more information")
         sys.exit(1)
 

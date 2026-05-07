@@ -101,7 +101,7 @@ class LLMConfig(BaseSettings):
         le=32,
     )
     frame_max_size: int = Field(
-        default=512,
+        default=768,
         description="Maximum frame dimension in pixels (reduces context usage)",
         ge=256,
         le=1920,

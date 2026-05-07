@@ -45,7 +45,7 @@ class PodStatus:
             private_port: The private port where vLLM is running (default 8000).
 
         Returns:
-            Full HTTP URL like https://{pod_id}-{public_port}.proxy.runpod.net/v1
+            Full HTTP URL like https://{pod_id}-{private_port}.proxy.runpod.net/v1
             or None if not found.
         """
         if not self.ports:
@@ -53,9 +53,9 @@ class PodStatus:
 
         for port in self.ports:
             if port.private_port == private_port and port.type == "http":
-                if port.is_public and port.public_port:
-                    # RunPod proxy URL format
-                    return f"https://{self.pod_id}-{port.public_port}.proxy.runpod.net/v1"
+                # RunPod proxy URL format uses pod_id and private_port
+                # The proxy works even when is_public is False
+                return f"https://{self.pod_id}-{private_port}.proxy.runpod.net/v1"
         return None
 
 
